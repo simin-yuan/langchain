@@ -1,7 +1,12 @@
+from collections.abc import Iterator
 from typing import Any, cast
 
+from typing_extensions import override
+
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.language_models import BaseChatModel
 from langchain_core.load import dumpd, load
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.messages import content as types
 from langchain_core.messages.ai import (
     InputTokenDetails,
@@ -14,6 +19,8 @@ from langchain_core.messages.ai import (
 from langchain_core.messages.tool import invalid_tool_call as create_invalid_tool_call
 from langchain_core.messages.tool import tool_call as create_tool_call
 from langchain_core.messages.tool import tool_call_chunk as create_tool_call_chunk
+from langchain_core.messages.utils import message_chunk_to_message
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
 
 
 def test_serdes_message() -> None:
@@ -588,3 +595,153 @@ def test_content_blocks_reasoning_extraction() -> None:
     content_blocks = message.content_blocks
     assert len(content_blocks) == 1
     assert content_blocks[0]["type"] == "text"
+
+
+_TRUNCATED_ARGS = '{"path": "report.txt", "content": "line 01\\nline 02\\nline 0'
+
+
+def test_tool_call_chunks_parse_partial_args_mid_stream() -> None:
+    # Mid-stream, partial arguments are still parsed for progressive display.
+    chunk = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(name="write_file", args=_TRUNCATED_ARGS, id="1")
+        ],
+    )
+    assert chunk.invalid_tool_calls == []
+    assert chunk.tool_calls[0]["args"]["path"] == "report.txt"
+
+
+def test_truncated_tool_call_args_are_invalid_after_stream_ends() -> None:
+    # A stream that ends while arguments are still incomplete (output limit
+    # reached or connection dropped) must not produce an executable tool call.
+    first = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(
+                name="write_file", args=_TRUNCATED_ARGS, id="1", index=0
+            )
+        ],
+    )
+    last = AIMessageChunk(content="", chunk_position="last")
+    final = first + last
+    assert final.tool_calls == []
+    assert len(final.invalid_tool_calls) == 1
+    invalid = final.invalid_tool_calls[0]
+    assert invalid["name"] == "write_file"
+    assert invalid["args"] == _TRUNCATED_ARGS
+    assert invalid["error"] is not None
+    assert "not valid JSON" in invalid["error"]
+
+    message = message_chunk_to_message(final)
+    assert isinstance(message, AIMessage)
+    assert message.tool_calls == []
+    assert message.invalid_tool_calls == final.invalid_tool_calls
+
+
+def test_complete_tool_call_args_after_stream_ends() -> None:
+    first = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(name="a", args='{"x": 1}', id="1", index=0),
+            create_tool_call_chunk(name="b", args="", id="2", index=1),
+        ],
+    )
+    final = first + AIMessageChunk(content="", chunk_position="last")
+    assert final.invalid_tool_calls == []
+    assert [(tc["name"], tc["args"]) for tc in final.tool_calls] == [
+        ("a", {"x": 1}),
+        ("b", {}),
+    ]
+
+
+def test_only_the_truncated_call_is_invalid_after_stream_ends() -> None:
+    # Parallel calls where only one is cut off: the complete call must stay
+    # executable, the cut one must not.
+    first = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(name="a", args='{"x": 1}', id="1", index=0),
+            create_tool_call_chunk(name="b", args='{"y": "line 0', id="2", index=1),
+        ],
+    )
+    final = first + AIMessageChunk(content="", chunk_position="last")
+    assert [tc["name"] for tc in final.tool_calls] == ["a"]
+    assert len(final.invalid_tool_calls) == 1
+    assert final.invalid_tool_calls[0]["name"] == "b"
+
+
+def test_raw_control_characters_after_stream_ends() -> None:
+    # Matches the non-streaming parser, which accepts raw control characters
+    # inside JSON strings (json.loads(..., strict=False)).
+    first = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            # "\n" below is a raw newline character inside the JSON string.
+            create_tool_call_chunk(
+                name="a", args='{"text": "one\ntwo"}', id="1", index=0
+            )
+        ],
+    )
+    final = first + AIMessageChunk(content="", chunk_position="last")
+    assert final.invalid_tool_calls == []
+    assert final.tool_calls[0]["args"] == {"text": "one\ntwo"}
+
+
+class _TruncatingChatModel(BaseChatModel):
+    """Streams a tool call whose arguments are cut off before the stream ends."""
+
+    streaming: bool = False
+
+    @property
+    @override
+    def _llm_type(self) -> str:
+        return "truncating"
+
+    @override
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        raise NotImplementedError
+
+    @override
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        for i in range(0, len(_TRUNCATED_ARGS), 8):
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        create_tool_call_chunk(
+                            name="write_file" if i == 0 else None,
+                            args=_TRUNCATED_ARGS[i : i + 8],
+                            id="call_1" if i == 0 else None,
+                            index=0,
+                        )
+                    ],
+                )
+            )
+
+
+def test_streamed_invoke_does_not_return_truncated_tool_call() -> None:
+    message = _TruncatingChatModel(streaming=True).invoke("write the report")
+    assert isinstance(message, AIMessage)
+    assert message.tool_calls == []
+    assert len(message.invalid_tool_calls) == 1
+    assert message.invalid_tool_calls[0]["args"] == _TRUNCATED_ARGS
+
+
+async def test_streamed_ainvoke_does_not_return_truncated_tool_call() -> None:
+    message = await _TruncatingChatModel(streaming=True).ainvoke("write the report")
+    assert isinstance(message, AIMessage)
+    assert message.tool_calls == []
+    assert len(message.invalid_tool_calls) == 1
