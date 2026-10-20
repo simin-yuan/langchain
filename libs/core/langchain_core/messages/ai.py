@@ -542,17 +542,31 @@ class AIMessageChunk(AIMessage, BaseMessageChunk):
         tool_calls = []
         invalid_tool_calls = []
 
-        def add_chunk_to_invalid_tool_calls(chunk: ToolCallChunk) -> None:
+        def add_chunk_to_invalid_tool_calls(
+            chunk: ToolCallChunk, error: str | None = None
+        ) -> None:
             invalid_tool_calls.append(
                 create_invalid_tool_call(
                     name=chunk["name"],
                     args=chunk["args"],
                     id=chunk["id"],
-                    error=None,
+                    error=error,
                 )
             )
 
+        # Once the stream has ended, partial JSON can no longer be completed by a
+        # later chunk: arguments that are still incomplete were cut off (output
+        # limit or dropped stream) and must not become an executable tool call.
+        stream_ended = self.chunk_position == "last"
         for chunk in self.tool_call_chunks:
+            if stream_ended and chunk["args"]:
+                try:
+                    json.loads(chunk["args"], strict=False)
+                except json.JSONDecodeError as e:
+                    add_chunk_to_invalid_tool_calls(
+                        chunk, f"Tool call arguments are not valid JSON: {e}"
+                    )
+                    continue
             try:
                 args_ = parse_partial_json(chunk["args"]) if chunk["args"] else {}
                 if isinstance(args_, dict):
