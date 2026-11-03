@@ -1,5 +1,5 @@
 import uuid
-from typing import Any, get_args
+from typing import Any, cast, get_args
 
 import pytest
 
@@ -457,6 +457,132 @@ def test_multiple_msg_with_name() -> None:
     assert messages_from_dict(messages_to_dict(msgs)) == msgs
 
 
+def test_message_chunk_to_message_moves_a_cut_off_tool_call() -> None:
+    """A stream that ends mid-argument must not produce a valid-looking tool call."""
+    partial = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(
+                name="write_file",
+                args='{"path": "report.txt", "content": "line 01',
+                id="call_1",
+                index=0,
+            )
+        ],
+        chunk_position="last",
+    )
+
+    message = cast("AIMessage", message_chunk_to_message(partial))
+
+    assert message.tool_calls == []
+    assert len(message.invalid_tool_calls) == 1
+    invalid = message.invalid_tool_calls[0]
+    assert invalid["name"] == "write_file"
+    assert invalid["id"] == "call_1"
+    assert invalid["args"] == '{"path": "report.txt", "content": "line 01'
+    assert invalid["error"]
+
+
+def test_message_chunk_to_message_keeps_the_complete_call_beside_a_cut_off_one() -> (
+    None
+):
+    """Only the call whose arguments are incomplete is moved."""
+    partial = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(
+                name="read_file", args='{"path": "a.txt"}', id="call_1", index=0
+            ),
+            create_tool_call_chunk(
+                name="write_file",
+                args='{"path": "b.txt", "content": "x',
+                id="call_2",
+                index=1,
+            ),
+        ],
+        chunk_position="last",
+    )
+
+    message = cast("AIMessage", message_chunk_to_message(partial))
+
+    assert [tc["name"] for tc in message.tool_calls] == ["read_file"]
+    assert [tc["name"] for tc in message.invalid_tool_calls] == ["write_file"]
+
+
+def test_message_chunk_to_message_keeps_a_call_with_a_raw_newline() -> None:
+    """Match the non-streaming parser: a raw newline inside a string is fine."""
+    args = '{"path": "report.txt", "content": "line 01\nline 02"}'
+    chunk = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(name="write_file", args=args, id="call_1", index=0)
+        ],
+        chunk_position="last",
+    )
+
+    message = cast("AIMessage", message_chunk_to_message(chunk))
+
+    assert [tc["name"] for tc in message.tool_calls] == ["write_file"]
+    assert message.invalid_tool_calls == []
+
+
+@pytest.mark.parametrize("args", ["", "{}"], ids=["empty", "empty_object"])
+def test_message_chunk_to_message_accepts_zero_argument_calls(args: str) -> None:
+    """A tool that takes no arguments is not a truncated one."""
+    chunk = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(name="list_files", args=args, id="call_1", index=0)
+        ],
+        chunk_position="last",
+    )
+
+    message = cast("AIMessage", message_chunk_to_message(chunk))
+
+    assert [tc["name"] for tc in message.tool_calls] == ["list_files"]
+    assert message.invalid_tool_calls == []
+
+
+def test_message_chunk_to_message_keeps_a_complete_call_without_finish_reason() -> None:
+    """A server is free to omit finish_reason; complete arguments must still run."""
+    chunk = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(
+                name="write_file",
+                args='{"path": "a.txt", "content": "x"}',
+                id="call_1",
+                index=0,
+            )
+        ],
+        response_metadata={},
+        chunk_position="last",
+    )
+
+    message = cast("AIMessage", message_chunk_to_message(chunk))
+
+    assert [tc["name"] for tc in message.tool_calls] == ["write_file"]
+    assert message.invalid_tool_calls == []
+
+
+def test_streaming_chunk_still_parses_arguments_leniently() -> None:
+    """The chunk keeps showing a half-written call; only the conversion is strict."""
+    chunk = AIMessageChunk(
+        content="",
+        tool_call_chunks=[
+            create_tool_call_chunk(
+                name="write_file",
+                args='{"path": "report.txt", "content": "lin',
+                id="c1",
+                index=0,
+            )
+        ],
+    )
+
+    assert [tc["name"] for tc in chunk.tool_calls] == ["write_file"]
+    assert chunk.invalid_tool_calls == []
+
+
 def test_message_chunk_to_message() -> None:
     assert message_chunk_to_message(
         AIMessageChunk(content="I am", additional_kwargs={"foo": "bar"})
@@ -484,11 +610,22 @@ def test_message_chunk_to_message() -> None:
         content="I am",
         tool_calls=[
             create_tool_call(name="tool1", args={"a": 1}, id="1"),
-            create_tool_call(name="tool2", args={}, id="2"),
             create_tool_call(name="tool3", args={}, id="3"),
         ],
         invalid_tool_calls=[
             create_invalid_tool_call(name="tool4", args="abc", id="4", error=None),
+            # ``{"b": `` is a stream that ended mid-argument: lenient parsing
+            # hides it as ``{}``, so the call looked complete. The raw string
+            # survives on the chunk, and the conversion re-checks it.
+            create_invalid_tool_call(
+                name="tool2",
+                args='{"b": ',
+                id="2",
+                error=(
+                    "Tool call arguments are not valid JSON: "
+                    "Expecting value: line 1 column 7 (char 6)"
+                ),
+            ),
         ],
     )
     assert message_chunk_to_message(chunk) == expected

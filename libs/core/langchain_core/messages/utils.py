@@ -40,6 +40,7 @@ from langchain_core.messages.block_translators.openai import (
 )
 from langchain_core.messages.chat import ChatMessage, ChatMessageChunk
 from langchain_core.messages.content import (
+    InvalidToolCall,
     is_data_content_block,
 )
 from langchain_core.messages.function import FunctionMessage, FunctionMessageChunk
@@ -570,6 +571,87 @@ def messages_from_dict(messages: Sequence[dict[str, Any]]) -> list[BaseMessage]:
     return [_message_from_dict(m) for m in messages]
 
 
+def _move_cut_off_tool_calls(
+    chunk: AIMessageChunk,
+) -> tuple[list[ToolCall], list[InvalidToolCall]] | None:
+    """Move cut-off tool calls into ``invalid_tool_calls``.
+
+    While a stream runs, ``parse_partial_json`` is deliberately lenient: a
+    half-written argument string should still render. On the finalized message
+    that leniency hides a failure - a call cut off mid-argument is filed under
+    ``tool_calls`` and looks complete, so a caller executes it with truncated
+    input. The raw string only survives on the chunk, which makes this
+    conversion the last place the cut is visible.
+
+    Parsing uses ``strict=False`` to match the non-streaming parser
+    (``_parse_tool_calls``), so a complete call whose argument string contains a
+    raw newline stays valid. This runs at conversion time only, so a chunk that
+    is still streaming keeps the lenient ``tool_calls`` it already has.
+
+    Returns:
+        The replacement ``tool_calls`` and ``invalid_tool_calls``, or ``None``
+        when nothing has to move.
+    """
+    tool_calls = list(chunk.tool_calls)
+    invalid_tool_calls = list(chunk.invalid_tool_calls)
+    # Chunks the lenient parse already rejected are in ``invalid_tool_calls``;
+    # don't file them twice.
+    already_invalid = {
+        (call.get("id"), call.get("args")) for call in invalid_tool_calls
+    }
+    moved = False
+
+    for call_chunk in chunk.tool_call_chunks:
+        raw = call_chunk["args"]
+        if not isinstance(raw, str) or raw.strip() in ("", "{}"):
+            # Nothing to judge: a zero-argument call is legitimate, and parsed
+            # arguments have no raw string.
+            continue
+        if (call_chunk["id"], raw) in already_invalid:
+            continue
+        try:
+            json.loads(raw, strict=False)
+            continue
+        except ValueError as e:
+            error = f"Tool call arguments are not valid JSON: {e}"
+
+        # Match the entry ``init_tool_calls`` built from this chunk: by id when
+        # the provider sends one, otherwise by name, which is all it carries.
+        index: int | None = None
+        if call_chunk["id"]:
+            index = next(
+                (
+                    i
+                    for i, tool_call in enumerate(tool_calls)
+                    if tool_call.get("id") == call_chunk["id"]
+                ),
+                None,
+            )
+        if index is None:
+            index = next(
+                (
+                    i
+                    for i, tool_call in enumerate(tool_calls)
+                    if tool_call.get("name") == (call_chunk["name"] or "")
+                ),
+                None,
+            )
+        if index is not None:
+            tool_calls.pop(index)
+        invalid_tool_calls.append(
+            {
+                "name": call_chunk["name"] or "",
+                "args": raw,
+                "id": call_chunk["id"],
+                "error": error,
+                "type": "invalid_tool_call",
+            }
+        )
+        moved = True
+
+    return (tool_calls, invalid_tool_calls) if moved else None
+
+
 def message_chunk_to_message(chunk: BaseMessage) -> BaseMessage:
     """Convert a message chunk to a `Message`.
 
@@ -583,14 +665,19 @@ def message_chunk_to_message(chunk: BaseMessage) -> BaseMessage:
         return chunk
     # chunk classes always have the equivalent non-chunk class as their first parent
     ignore_keys = ["type"]
+    tool_call_fields: dict[str, Any] = {}
     if isinstance(chunk, AIMessageChunk):
         ignore_keys.extend(["tool_call_chunks", "chunk_position"])
-    return cast(
-        "BaseMessage",
-        chunk.__class__.__mro__[1](
-            **{k: v for k, v in chunk.__dict__.items() if k not in ignore_keys}
-        ),
-    )
+        moved = _move_cut_off_tool_calls(chunk)
+        if moved is not None:
+            tool_calls, invalid_tool_calls = moved
+            tool_call_fields = {
+                "tool_calls": tool_calls,
+                "invalid_tool_calls": invalid_tool_calls,
+            }
+    fields = {k: v for k, v in chunk.__dict__.items() if k not in ignore_keys}
+    fields.update(tool_call_fields)
+    return cast("BaseMessage", chunk.__class__.__mro__[1](**fields))
 
 
 MessageLikeRepresentation = (
