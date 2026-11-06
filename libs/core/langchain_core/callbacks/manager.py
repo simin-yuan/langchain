@@ -1209,6 +1209,7 @@ class AsyncCallbackManagerForToolRun(AsyncParentRunManager, ToolManagerMixin):
             inheritable_metadata=self.inheritable_metadata,
         )
 
+    @shielded
     async def on_tool_end(self, output: Any, **kwargs: Any) -> None:
         """Async run when the tool ends running.
 
@@ -1230,6 +1231,7 @@ class AsyncCallbackManagerForToolRun(AsyncParentRunManager, ToolManagerMixin):
             **kwargs,
         )
 
+    @shielded
     async def on_tool_error(
         self,
         error: BaseException,
