@@ -229,6 +229,23 @@ async def atrace_as_chain_group(
 Func = TypeVar("Func", bound=Callable[..., Any])
 
 
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _schedule_background(coro: Coroutine[Any, Any, None]) -> None:
+    """Run a callback dispatch without awaiting it.
+
+    Used when the frame that would await it is already being torn down: a
+    cancellation that landed during the start dispatch lands again on the very
+    next await, so an awaited error callback would never fire.
+    """
+    task = asyncio.get_running_loop().create_task(coro)
+    # Keep a reference until the task finishes; the loop only tracks scheduled
+    # callbacks, so a detached task can otherwise be collected mid-flight.
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 def shielded(func: Func) -> Func:
     """Makes so an awaitable method is always shielded from cancellation.
 
@@ -2055,18 +2072,38 @@ class AsyncCallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
-        await ahandle_event(
-            self.handlers,
-            "on_chain_start",
-            "ignore_chain",
-            serialized,
-            inputs,
-            run_id=run_id,
-            parent_run_id=self.parent_run_id,
-            tags=self.tags,
-            metadata=self.metadata,
-            **kwargs,
-        )
+        try:
+            await ahandle_event(
+                self.handlers,
+                "on_chain_start",
+                "ignore_chain",
+                serialized,
+                inputs,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+                **kwargs,
+            )
+        except BaseException as e:
+            # The start dispatch was interrupted (e.g. a cancellation from a
+            # cancel scope landing mid-dispatch). Handlers may already have
+            # opened the run, so close it before letting the exception out.
+            # It cannot be awaited here: the next await in this frame would be
+            # cancelled again, so the close is dispatched as a detached task.
+            _schedule_background(
+                ahandle_event(
+                    self.handlers,
+                    "on_chain_error",
+                    "ignore_chain",
+                    e,
+                    run_id=run_id,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                )
+            )
+            raise
 
         return AsyncCallbackManagerForChainRun(
             run_id=run_id,
@@ -2103,18 +2140,38 @@ class AsyncCallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
-        await ahandle_event(
-            self.handlers,
-            "on_tool_start",
-            "ignore_agent",
-            serialized,
-            input_str,
-            run_id=run_id,
-            parent_run_id=self.parent_run_id,
-            tags=self.tags,
-            metadata=self.metadata,
-            **kwargs,
-        )
+        try:
+            await ahandle_event(
+                self.handlers,
+                "on_tool_start",
+                "ignore_agent",
+                serialized,
+                input_str,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+                **kwargs,
+            )
+        except BaseException as e:
+            # The start dispatch was interrupted (e.g. a cancellation from a
+            # cancel scope landing mid-dispatch). Handlers may already have
+            # opened the run, so close it before letting the exception out.
+            # It cannot be awaited here: the next await in this frame would be
+            # cancelled again, so the close is dispatched as a detached task.
+            _schedule_background(
+                ahandle_event(
+                    self.handlers,
+                    "on_tool_error",
+                    "ignore_agent",
+                    e,
+                    run_id=run_id,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                )
+            )
+            raise
 
         return AsyncCallbackManagerForToolRun(
             run_id=run_id,
@@ -2195,18 +2252,38 @@ class AsyncCallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
-        await ahandle_event(
-            self.handlers,
-            "on_retriever_start",
-            "ignore_retriever",
-            serialized,
-            query,
-            run_id=run_id,
-            parent_run_id=self.parent_run_id,
-            tags=self.tags,
-            metadata=self.metadata,
-            **kwargs,
-        )
+        try:
+            await ahandle_event(
+                self.handlers,
+                "on_retriever_start",
+                "ignore_retriever",
+                serialized,
+                query,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+                **kwargs,
+            )
+        except BaseException as e:
+            # The start dispatch was interrupted (e.g. a cancellation from a
+            # cancel scope landing mid-dispatch). Handlers may already have
+            # opened the run, so close it before letting the exception out.
+            # It cannot be awaited here: the next await in this frame would be
+            # cancelled again, so the close is dispatched as a detached task.
+            _schedule_background(
+                ahandle_event(
+                    self.handlers,
+                    "on_retriever_error",
+                    "ignore_retriever",
+                    e,
+                    run_id=run_id,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                )
+            )
+            raise
 
         return AsyncCallbackManagerForRetrieverRun(
             run_id=run_id,
