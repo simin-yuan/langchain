@@ -1919,6 +1919,47 @@ class AsyncCallbackManager(BaseCallbackManager):
         ]
         managers = []
 
+        async def _dispatch_start(
+            handlers: list[BaseCallbackHandler],
+            prompt: str,
+            prompt_run_id: UUID,
+        ) -> None:
+            try:
+                await ahandle_event(
+                    handlers,
+                    "on_llm_start",
+                    "ignore_llm",
+                    serialized,
+                    [prompt],
+                    run_id=prompt_run_id,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                    **kwargs,
+                )
+            except BaseException as e:
+                # The start dispatch was interrupted (e.g. a cancellation from a
+                # cancel scope landing mid-dispatch). Handlers may already have
+                # opened the run, so close it before letting the exception out.
+                # It cannot be awaited here: the next await in this frame would
+                # be cancelled again, so the close is dispatched as a detached
+                # task. The error goes to the same handlers the start went to,
+                # so every handler that saw the start sees the matching error
+                # under the same run_id.
+                _schedule_background(
+                    ahandle_event(
+                        handlers,
+                        "on_llm_error",
+                        "ignore_llm",
+                        e,
+                        run_id=prompt_run_id,
+                        parent_run_id=self.parent_run_id,
+                        tags=self.tags,
+                        metadata=self.metadata,
+                    )
+                )
+                raise
+
         for prompt in prompts:
             if run_id is not None:
                 run_id_ = run_id
@@ -1927,34 +1968,10 @@ class AsyncCallbackManager(BaseCallbackManager):
                 run_id_ = uuid7()
 
             if inline_handlers:
-                inline_tasks.append(
-                    ahandle_event(
-                        inline_handlers,
-                        "on_llm_start",
-                        "ignore_llm",
-                        serialized,
-                        [prompt],
-                        run_id=run_id_,
-                        parent_run_id=self.parent_run_id,
-                        tags=self.tags,
-                        metadata=self.metadata,
-                        **kwargs,
-                    )
-                )
+                inline_tasks.append(_dispatch_start(inline_handlers, prompt, run_id_))
             else:
                 non_inline_tasks.append(
-                    ahandle_event(
-                        non_inline_handlers,
-                        "on_llm_start",
-                        "ignore_llm",
-                        serialized,
-                        [prompt],
-                        run_id=run_id_,
-                        parent_run_id=self.parent_run_id,
-                        tags=self.tags,
-                        metadata=self.metadata,
-                        **kwargs,
-                    )
+                    _dispatch_start(non_inline_handlers, prompt, run_id_)
                 )
 
             managers.append(
@@ -2003,6 +2020,41 @@ class AsyncCallbackManager(BaseCallbackManager):
         non_inline_tasks = []
         managers = []
 
+        async def _dispatch_start(
+            handler: BaseCallbackHandler,
+            message_list: list[BaseMessage],
+            message_run_id: UUID,
+        ) -> None:
+            try:
+                await ahandle_event(
+                    [handler],
+                    "on_chat_model_start",
+                    "ignore_chat_model",
+                    serialized,
+                    [message_list],
+                    run_id=message_run_id,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                    **kwargs,
+                )
+            except BaseException as e:
+                # Same as on_llm_start: the run is closed from a detached task,
+                # under the run_id the start was opened with.
+                _schedule_background(
+                    ahandle_event(
+                        [handler],
+                        "on_llm_error",
+                        "ignore_llm",
+                        e,
+                        run_id=message_run_id,
+                        parent_run_id=self.parent_run_id,
+                        tags=self.tags,
+                        metadata=self.metadata,
+                    )
+                )
+                raise
+
         for message_list in messages:
             if run_id is not None:
                 run_id_ = run_id
@@ -2011,18 +2063,7 @@ class AsyncCallbackManager(BaseCallbackManager):
                 run_id_ = uuid7()
 
             for handler in self.handlers:
-                task = ahandle_event(
-                    [handler],
-                    "on_chat_model_start",
-                    "ignore_chat_model",
-                    serialized,
-                    [message_list],
-                    run_id=run_id_,
-                    parent_run_id=self.parent_run_id,
-                    tags=self.tags,
-                    metadata=self.metadata,
-                    **kwargs,
-                )
+                task = _dispatch_start(handler, message_list, run_id_)
                 if handler.run_inline:
                     inline_tasks.append(task)
                 else:

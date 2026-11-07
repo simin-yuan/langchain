@@ -17,6 +17,8 @@ from typing_extensions import override
 
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.documents import Document
+from langchain_core.language_models.fake import FakeListLLM
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import (
     Runnable,
@@ -63,6 +65,18 @@ class _BlockingStartHandler(AsyncCallbackHandler):
         await self._record("on_retriever_start", kwargs.get("run_id"))
 
     @override
+    async def on_llm_start(self, *args: Any, **kwargs: Any) -> None:
+        await self._record("on_llm_start", kwargs.get("run_id"))
+
+    @override
+    async def on_chat_model_start(self, *args: Any, **kwargs: Any) -> None:
+        await self._record("on_chat_model_start", kwargs.get("run_id"))
+
+    @override
+    async def on_llm_error(self, *args: Any, **kwargs: Any) -> None:
+        await self._record("on_llm_error", kwargs.get("run_id"))
+
+    @override
     async def on_chain_error(self, *args: Any, **kwargs: Any) -> None:
         await self._record("on_chain_error", kwargs.get("run_id"))
 
@@ -100,6 +114,12 @@ async def _invoke(component: str, config: RunnableConfig) -> None:
         await _echo.ainvoke({"text": "hi"}, config=config)
     elif component == "retriever":
         await _StaticRetriever().ainvoke("hi", config=config)
+    elif component == "llm":
+        await FakeListLLM(responses=["ok"]).ainvoke("hi", config=config)
+    elif component == "chat_model":
+        await FakeListChatModel(responses=["ok"]).ainvoke(
+            [("user", "hi")], config=config
+        )
     else:  # pragma: no cover
         msg = f"unknown component {component}"
         raise AssertionError(msg)
@@ -125,6 +145,8 @@ async def _cancel_during_start(
         ("chain", "on_chain_start", "on_chain_error"),
         ("tool", "on_tool_start", "on_tool_error"),
         ("retriever", "on_retriever_start", "on_retriever_error"),
+        ("llm", "on_llm_start", "on_llm_error"),
+        ("chat_model", "on_chat_model_start", "on_llm_error"),
     ],
 )
 async def test_cancelled_start_dispatch_still_closes_the_run(
