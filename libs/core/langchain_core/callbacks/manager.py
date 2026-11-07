@@ -1411,18 +1411,34 @@ class CallbackManager(BaseCallbackManager):
         for i, prompt in enumerate(prompts):
             # Can't have duplicate runs with the same run ID (if provided)
             run_id_ = run_id if i == 0 and run_id is not None else uuid7()
-            handle_event(
-                self.handlers,
-                "on_llm_start",
-                "ignore_llm",
-                serialized,
-                [prompt],
-                run_id=run_id_,
-                parent_run_id=self.parent_run_id,
-                tags=self.tags,
-                metadata=self.metadata,
-                **kwargs,
-            )
+            try:
+                handle_event(
+                    self.handlers,
+                    "on_llm_start",
+                    "ignore_llm",
+                    serialized,
+                    [prompt],
+                    run_id=run_id_,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                    **kwargs,
+                )
+            except BaseException as e:
+                # The start dispatch was interrupted partway through (e.g. an
+                # interrupt raised from inside a handler). Handlers may already
+                # have opened the run, so close it before letting it out.
+                handle_event(
+                    self.handlers,
+                    "on_llm_error",
+                    "ignore_llm",
+                    e,
+                    run_id=run_id_,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                )
+                raise
 
             managers.append(
                 CallbackManagerForLLMRun(
@@ -1465,18 +1481,34 @@ class CallbackManager(BaseCallbackManager):
                 run_id = None
             else:
                 run_id_ = uuid7()
-            handle_event(
-                self.handlers,
-                "on_chat_model_start",
-                "ignore_chat_model",
-                serialized,
-                [message_list],
-                run_id=run_id_,
-                parent_run_id=self.parent_run_id,
-                tags=self.tags,
-                metadata=self.metadata,
-                **kwargs,
-            )
+            try:
+                handle_event(
+                    self.handlers,
+                    "on_chat_model_start",
+                    "ignore_chat_model",
+                    serialized,
+                    [message_list],
+                    run_id=run_id_,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                    **kwargs,
+                )
+            except BaseException as e:
+                # The start dispatch was interrupted partway through (e.g. an
+                # interrupt raised from inside a handler). Handlers may already
+                # have opened the run, so close it before letting it out.
+                handle_event(
+                    self.handlers,
+                    "on_llm_error",
+                    "ignore_llm",
+                    e,
+                    run_id=run_id_,
+                    parent_run_id=self.parent_run_id,
+                    tags=self.tags,
+                    metadata=self.metadata,
+                )
+                raise
 
             managers.append(
                 CallbackManagerForLLMRun(
@@ -1514,18 +1546,34 @@ class CallbackManager(BaseCallbackManager):
         """
         if run_id is None:
             run_id = uuid7()
-        handle_event(
-            self.handlers,
-            "on_chain_start",
-            "ignore_chain",
-            serialized,
-            inputs,
-            run_id=run_id,
-            parent_run_id=self.parent_run_id,
-            tags=self.tags,
-            metadata=self.metadata,
-            **kwargs,
-        )
+        try:
+            handle_event(
+                self.handlers,
+                "on_chain_start",
+                "ignore_chain",
+                serialized,
+                inputs,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+                **kwargs,
+            )
+        except BaseException as e:
+            # The start dispatch was interrupted partway through (e.g. an
+            # interrupt raised from inside a handler). Handlers may already have
+            # opened the run, so close it before letting it out.
+            handle_event(
+                self.handlers,
+                "on_chain_error",
+                "ignore_chain",
+                e,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+            )
+            raise
 
         return CallbackManagerForChainRun(
             run_id=run_id,
@@ -1573,19 +1621,35 @@ class CallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
-        handle_event(
-            self.handlers,
-            "on_tool_start",
-            "ignore_agent",
-            serialized,
-            input_str,
-            run_id=run_id,
-            parent_run_id=self.parent_run_id,
-            tags=self.tags,
-            metadata=self.metadata,
-            inputs=inputs,
-            **kwargs,
-        )
+        try:
+            handle_event(
+                self.handlers,
+                "on_tool_start",
+                "ignore_agent",
+                serialized,
+                input_str,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+                inputs=inputs,
+                **kwargs,
+            )
+        except BaseException as e:
+            # The start dispatch was interrupted partway through (e.g. an
+            # interrupt raised from inside a handler). Handlers may already have
+            # opened the run, so close it before letting it out.
+            handle_event(
+                self.handlers,
+                "on_tool_error",
+                "ignore_agent",
+                e,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+            )
+            raise
 
         return CallbackManagerForToolRun(
             run_id=run_id,
@@ -1622,18 +1686,34 @@ class CallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
-        handle_event(
-            self.handlers,
-            "on_retriever_start",
-            "ignore_retriever",
-            serialized,
-            query,
-            run_id=run_id,
-            parent_run_id=self.parent_run_id,
-            tags=self.tags,
-            metadata=self.metadata,
-            **kwargs,
-        )
+        try:
+            handle_event(
+                self.handlers,
+                "on_retriever_start",
+                "ignore_retriever",
+                serialized,
+                query,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+                **kwargs,
+            )
+        except BaseException as e:
+            # The start dispatch was interrupted partway through (e.g. an
+            # interrupt raised from inside a handler). Handlers may already have
+            # opened the run, so close it before letting it out.
+            handle_event(
+                self.handlers,
+                "on_retriever_error",
+                "ignore_retriever",
+                e,
+                run_id=run_id,
+                parent_run_id=self.parent_run_id,
+                tags=self.tags,
+                metadata=self.metadata,
+            )
+            raise
 
         return CallbackManagerForRetrieverRun(
             run_id=run_id,
