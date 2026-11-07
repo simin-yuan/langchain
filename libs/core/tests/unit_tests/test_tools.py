@@ -1,6 +1,7 @@
 """Test the base tool implementation."""
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -41,6 +42,7 @@ from typing_extensions import TypedDict, override
 
 from langchain_core import tools
 from langchain_core.callbacks import (
+    AsyncCallbackHandler,
     AsyncCallbackManagerForToolRun,
     BaseCallbackHandler,
     CallbackManagerForToolRun,
@@ -1276,6 +1278,61 @@ async def test_async_tool_cancellation_calls_on_tool_error() -> None:
 
     assert len(handler.tool_errors) == 1
     assert isinstance(handler.tool_errors[0], asyncio.CancelledError)
+
+
+class _AsyncToolEventRecorder(AsyncCallbackHandler):
+    """Records tool end/error events after yielding to the event loop once.
+
+    The yield matters: inside a cancelled anyio scope an unshielded callback is
+    cut off at its first suspension point, so recording only after a suspension
+    makes a missing shield fail every time instead of depending on timing.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, Any]] = []
+        self._recorded = asyncio.Event()
+
+    @override
+    async def on_tool_end(self, output: Any, **kwargs: Any) -> None:
+        await asyncio.sleep(0)
+        self.events.append(("end", output))
+        self._recorded.set()
+
+    @override
+    async def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
+        await asyncio.sleep(0)
+        self.events.append(("error", error))
+        self._recorded.set()
+
+    async def settle(self) -> None:
+        """Give a shielded callback, which outlives the cancelled scope, time to run."""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._recorded.wait(), timeout=1)
+
+
+async def test_anyio_scope_cancellation_calls_on_tool_error() -> None:
+    """A tool cancelled by an anyio cancel scope still closes its run with an error.
+
+    Starlette and FastAPI cancel request handlers this way on client disconnect.
+    """
+    anyio = pytest.importorskip("anyio")
+    recorder = _AsyncToolEventRecorder()
+
+    with anyio.CancelScope() as scope:
+
+        @tool
+        async def hanging_tool() -> str:
+            """Cancel the surrounding scope, then wait."""
+            scope.cancel()
+            await asyncio.Event().wait()
+            return "unreachable"
+
+        await hanging_tool.ainvoke({}, config={"callbacks": [recorder]})
+
+    await recorder.settle()
+    assert scope.cancelled_caught
+    assert [name for name, _ in recorder.events] == ["error"]
+    assert isinstance(recorder.events[0][1], asyncio.CancelledError)
 
 
 def test_optional_subset_model_rewrite() -> None:
