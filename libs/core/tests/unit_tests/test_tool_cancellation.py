@@ -54,9 +54,7 @@ def test_cancel_from_anyio_scope_closes_the_tool_run() -> None:
 
     async def scenario() -> None:
         with anyio.move_on_after(0.1):
-            await _SlowTool().ainvoke(
-                {"query": "q"}, config={"callbacks": [recorder]}
-            )
+            await _SlowTool().ainvoke({"query": "q"}, config={"callbacks": [recorder]})
         for _ in range(50):
             if len(recorder.events) == 2:
                 break
