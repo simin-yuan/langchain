@@ -9,6 +9,7 @@ for every call, including calls that end in ``asyncio.CancelledError`` or
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 import pytest
@@ -130,3 +131,61 @@ def test_successful_call_reports_end() -> None:
     docs = _SlowRetriever().invoke("q", config={"callbacks": [recorder]})
     assert len(docs) == 1
     assert recorder.events == ["start", "end"]
+
+
+class _SuspendingAsyncRecorder(AsyncCallbackHandler):
+    """Records end/error only after yielding once.
+
+    Inside a cancelled anyio scope an unshielded callback dies at its first
+    suspension point, so recording after a suspension makes a missing shield
+    fail every time instead of depending on timing.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, Any]] = []
+        self._recorded = asyncio.Event()
+
+    async def on_retriever_end(self, documents: Any, **kwargs: Any) -> None:
+        await asyncio.sleep(0)
+        self.events.append(("end", documents))
+        self._recorded.set()
+
+    async def on_retriever_error(self, error: BaseException, **kwargs: Any) -> None:
+        await asyncio.sleep(0)
+        self.events.append(("error", error))
+        self._recorded.set()
+
+    async def settle(self) -> None:
+        """Give a shielded callback, which outlives the cancelled scope, time to run."""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._recorded.wait(), timeout=1)
+
+
+async def test_anyio_scope_cancellation_calls_on_retriever_error() -> None:
+    """A retrieval cancelled by an anyio cancel scope still closes its run.
+
+    Starlette and FastAPI cancel request handlers this way on client disconnect.
+    """
+    anyio = pytest.importorskip("anyio")
+    recorder = _SuspendingAsyncRecorder()
+
+    class _CancellingRetriever(BaseRetriever):
+        def _get_relevant_documents(
+            self, query: str, **_kwargs: Any
+        ) -> list[Document]:
+            return [Document(page_content=query)]
+
+        async def _aget_relevant_documents(
+            self, query: str, **_kwargs: Any
+        ) -> list[Document]:
+            scope.cancel()
+            await asyncio.Event().wait()
+            return [Document(page_content=query)]
+
+    with anyio.CancelScope() as scope:
+        await _CancellingRetriever().ainvoke("q", config={"callbacks": [recorder]})
+
+    await recorder.settle()
+    assert scope.cancelled_caught
+    assert [name for name, _ in recorder.events] == ["error"]
+    assert isinstance(recorder.events[0][1], asyncio.CancelledError)
