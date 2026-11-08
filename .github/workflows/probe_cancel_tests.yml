@@ -1,0 +1,45 @@
+# Temporary CI probe (local/ branch only, never merged).
+# Runs the cancellation tests the way CI runs them, 50 times each, to prove
+# they are not environment-dependent. Manual trigger only.
+
+name: "probe-cancel-tests"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "true"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: libs/core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Sync dependencies
+        run: uv sync --group test
+      - name: Agent callback cancellation, 50x
+        run: |
+          for i in $(seq 1 50); do
+            echo "=== agent run $i ==="
+            uv run --group test pytest -q -p no:cacheprovider \
+              --disable-socket --allow-unix-socket \
+              tests/unit_tests/callbacks/test_agent_callback_cancellation.py \
+              tests/unit_tests/callbacks/test_async_callback_manager.py \
+              -k "agent or anyio" || exit 1
+          done
+      - name: Tool cancellation, 50x
+        run: |
+          for i in $(seq 1 50); do
+            echo "=== tool run $i ==="
+            uv run --group test pytest -q -p no:cacheprovider \
+              --disable-socket --allow-unix-socket \
+              tests/unit_tests/test_tools.py -k "anyio or cancellation" || exit 1
+          done
