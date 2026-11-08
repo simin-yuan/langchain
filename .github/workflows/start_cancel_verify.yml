@@ -1,0 +1,112 @@
+# Linux verification for the start-dispatch cancellation fix (probe branch only; never merged).
+# Checks out each fix branch and runs its new tests the way CI runs them, 30x per Python version.
+
+name: "start-cancel-verify"
+
+on:
+  push:
+    branches: ["ci/start-cancel-verify"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "true"
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        ref:
+          - fix/start-cancel-async-core
+          - fix/start-cancel-async-llm
+          - fix/start-cancel-sync
+        python: ["3.10", "3.12"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: libs/core
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Sync dependencies
+        run: uv sync --group test
+      - name: Start-dispatch cancellation tests, 30x
+        run: |
+          files=$(ls tests/unit_tests/callbacks/test_start_dispatch_*.py 2>/dev/null || true)
+          if [ -z "$files" ]; then
+            echo "no start-dispatch tests on ${REF}"; exit 1
+          fi
+          echo "files: $files"
+          pass=0; fail=0
+          for i in $(seq 1 30); do
+            if uv run --group test pytest -q -p no:cacheprovider \
+                 --disable-socket --allow-unix-socket $files > /tmp/sc.log 2>&1; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1)); echo "--- failure on run $i ---"; cat /tmp/sc.log
+            fi
+          done
+          echo "SC ${REF} py${{ matrix.python }}: pass=$pass fail=$fail"
+          test "$fail" -eq 0
+        env:
+          REF: ${{ matrix.ref }}
+      - name: Issue repro closes the run
+        if: contains(matrix.ref, 'async')
+        run: |
+          cat > /tmp/repro.py <<'PY'
+          import asyncio
+          import contextlib
+
+          from langchain_core.callbacks import AsyncCallbackHandler
+          from langchain_core.runnables import RunnableLambda
+
+
+          class Handler(AsyncCallbackHandler):
+              def __init__(self):
+                  self.dispatched = asyncio.Event()
+                  self.closed = asyncio.Event()
+                  self.events = []
+
+              async def on_chain_start(self, *args, run_id=None, **kwargs):
+                  self.events.append(("start", run_id))
+                  self.dispatched.set()
+                  await asyncio.Event().wait()
+
+              async def on_chain_end(self, *args, run_id=None, **kwargs):
+                  self.events.append(("end", run_id))
+                  self.closed.set()
+
+              async def on_chain_error(self, *args, run_id=None, **kwargs):
+                  self.events.append(("error", run_id))
+                  self.closed.set()
+
+
+          async def main():
+              handler = Handler()
+              task = asyncio.create_task(
+                  RunnableLambda(lambda x: x).ainvoke("hello", config={"callbacks": [handler]})
+              )
+              await handler.dispatched.wait()
+              task.cancel()
+              with contextlib.suppress(asyncio.CancelledError):
+                  await task
+              try:
+                  await asyncio.wait_for(handler.closed.wait(), timeout=1)
+              except TimeoutError:
+                  print("ORPHANS: 1", [(n, str(r)) for n, r in handler.events])
+                  return
+              print("ORPHANS: 0", [(n, str(r)) for n, r in handler.events])
+
+
+          asyncio.run(main())
+          PY
+          uv run --group test python /tmp/repro.py | tee /tmp/repro.out
+          grep -q "ORPHANS: 0" /tmp/repro.out
