@@ -186,3 +186,51 @@ async def test_cancelled_from_a_cancel_scope_closes_the_run() -> None:
     closed = [run_id for name, run_id in handler.events if name == "on_chain_error"]
     assert len(opened) == 1, handler.events
     assert closed == opened, handler.events
+
+
+class _InlineBlocker(_BlockingStartHandler):
+    """Inline handler: the dispatch awaits it before reaching the next one."""
+
+    run_inline = True
+
+
+class _InlineRecorder(AsyncCallbackHandler):
+    run_inline = True
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    @override
+    async def on_chain_start(self, *args: Any, **kwargs: Any) -> None:
+        self.events.append("on_chain_start")
+
+    @override
+    async def on_chain_error(self, *args: Any, **kwargs: Any) -> None:
+        self.events.append("on_chain_error")
+
+
+async def test_handler_the_dispatch_never_reached_sees_no_error() -> None:
+    """A handler that never got a start must not receive the error.
+
+    Inline handlers are dispatched one after another, so a cancellation inside
+    the first one means the second was never entered. Closing its run would hand
+    it an error for a run it never opened.
+    """
+    blocker = _InlineBlocker("on_chain_start", "on_chain_error")
+    unreached = _InlineRecorder()
+    config = RunnableConfig(callbacks=[blocker, unreached])
+
+    task = asyncio.create_task(RunnableLambda(lambda x: x).ainvoke("hi", config=config))
+    await asyncio.wait_for(blocker.reached.wait(), TIMEOUT)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(blocker.closed.wait(), TIMEOUT)
+    # A spurious dispatch would already have run; give it room to show up.
+    await asyncio.sleep(0.1)
+
+    assert [name for name, _ in blocker.events] == [
+        "on_chain_start",
+        "on_chain_error",
+    ], blocker.events
+    assert unreached.events == [], unreached.events
