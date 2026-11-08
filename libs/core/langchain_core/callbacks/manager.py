@@ -244,6 +244,14 @@ def _schedule_background(coro: Coroutine[Any, Any, None]) -> None:
     # callbacks, so a detached task can otherwise be collected mid-flight.
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    # Nobody awaits this task, so retrieve a handler exception here; otherwise
+    # the loop reports "Task exception was never retrieved" at shutdown.
+    task.add_done_callback(_consume_exception)
+
+
+def _consume_exception(task: asyncio.Task[None]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def shielded(func: Func) -> Func:
@@ -512,6 +520,39 @@ async def ahandle_event(
             for handler in handlers
             if not handler.run_inline
         )
+    )
+
+
+async def ahandle_event_tracked(
+    handlers: list[BaseCallbackHandler],
+    event_name: str,
+    ignore_condition_name: str | None,
+    entered: set[int],
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Dispatch an event, recording which handlers the callback was entered on.
+
+    Same dispatch order as `ahandle_event`, but each handler is added to
+    `entered` *before* its callback is invoked. A caller whose dispatch is
+    interrupted can then close the run for exactly the handlers that were
+    entered, and leave alone the handlers the loop never reached.
+
+    "Entered" rather than "finished" is what the pairing invariant needs: the
+    handler that records a start and then blocks inside the callback is the one
+    whose run is orphaned, and its callback never finishes.
+    """
+
+    async def _dispatch(handler: BaseCallbackHandler) -> None:
+        entered.add(id(handler))
+        await _ahandle_event_for_handler(
+            handler, event_name, ignore_condition_name, *args, **kwargs
+        )
+
+    for handler in [h for h in handlers if h.run_inline]:
+        await _dispatch(handler)
+    await asyncio.gather(
+        *(_dispatch(handler) for handler in handlers if not handler.run_inline)
     )
 
 
@@ -1924,11 +1965,13 @@ class AsyncCallbackManager(BaseCallbackManager):
             prompt: str,
             prompt_run_id: UUID,
         ) -> None:
+            entered: set[int] = set()
             try:
-                await ahandle_event(
+                await ahandle_event_tracked(
                     handlers,
                     "on_llm_start",
                     "ignore_llm",
+                    entered,
                     serialized,
                     [prompt],
                     run_id=prompt_run_id,
@@ -1948,7 +1991,7 @@ class AsyncCallbackManager(BaseCallbackManager):
                 # under the same run_id.
                 _schedule_background(
                     ahandle_event(
-                        handlers,
+                        [h for h in handlers if id(h) in entered],
                         "on_llm_error",
                         "ignore_llm",
                         e,
@@ -2025,11 +2068,13 @@ class AsyncCallbackManager(BaseCallbackManager):
             message_list: list[BaseMessage],
             message_run_id: UUID,
         ) -> None:
+            entered: set[int] = set()
             try:
-                await ahandle_event(
+                await ahandle_event_tracked(
                     [handler],
                     "on_chat_model_start",
                     "ignore_chat_model",
+                    entered,
                     serialized,
                     [message_list],
                     run_id=message_run_id,
@@ -2043,7 +2088,7 @@ class AsyncCallbackManager(BaseCallbackManager):
                 # under the run_id the start was opened with.
                 _schedule_background(
                     ahandle_event(
-                        [handler],
+                        [handler] if id(handler) in entered else [],
                         "on_llm_error",
                         "ignore_llm",
                         e,
@@ -2113,11 +2158,13 @@ class AsyncCallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
+        entered: set[int] = set()
         try:
-            await ahandle_event(
+            await ahandle_event_tracked(
                 self.handlers,
                 "on_chain_start",
                 "ignore_chain",
+            entered,
                 serialized,
                 inputs,
                 run_id=run_id,
@@ -2134,7 +2181,7 @@ class AsyncCallbackManager(BaseCallbackManager):
             # cancelled again, so the close is dispatched as a detached task.
             _schedule_background(
                 ahandle_event(
-                    self.handlers,
+                    [h for h in self.handlers if id(h) in entered],
                     "on_chain_error",
                     "ignore_chain",
                     e,
@@ -2181,11 +2228,13 @@ class AsyncCallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
+        entered: set[int] = set()
         try:
-            await ahandle_event(
+            await ahandle_event_tracked(
                 self.handlers,
                 "on_tool_start",
                 "ignore_agent",
+            entered,
                 serialized,
                 input_str,
                 run_id=run_id,
@@ -2202,7 +2251,7 @@ class AsyncCallbackManager(BaseCallbackManager):
             # cancelled again, so the close is dispatched as a detached task.
             _schedule_background(
                 ahandle_event(
-                    self.handlers,
+                    [h for h in self.handlers if id(h) in entered],
                     "on_tool_error",
                     "ignore_agent",
                     e,
@@ -2293,11 +2342,13 @@ class AsyncCallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
+        entered: set[int] = set()
         try:
-            await ahandle_event(
+            await ahandle_event_tracked(
                 self.handlers,
                 "on_retriever_start",
                 "ignore_retriever",
+            entered,
                 serialized,
                 query,
                 run_id=run_id,
@@ -2314,7 +2365,7 @@ class AsyncCallbackManager(BaseCallbackManager):
             # cancelled again, so the close is dispatched as a detached task.
             _schedule_background(
                 ahandle_event(
-                    self.handlers,
+                    [h for h in self.handlers if id(h) in entered],
                     "on_retriever_error",
                     "ignore_retriever",
                     e,
