@@ -62,3 +62,36 @@ jobs:
           done
           echo "TOOL py${{ matrix.python }}: pass=$pass fail=$fail"
           test "$fail" -eq 0
+
+  retriever300:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the retriever probe branch
+        uses: actions/checkout@v4
+        with:
+          ref: ci/retriever-verify
+          path: lc
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Sync dependencies
+        working-directory: lc/libs/core
+        run: uv sync --group test
+      - name: Retriever anyio cancellation, 300x
+        working-directory: lc/libs/core
+        run: |
+          pass=0; fail=0
+          for i in $(seq 1 300); do
+            if uv run --group test pytest -q -p no:cacheprovider                  --disable-socket --allow-unix-socket                  tests/unit_tests/test_retrievers.py -k anyio > /tmp/r.log 2>&1 && grep -q "1 passed" /tmp/r.log; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1)); echo "--- failure on run $i ---"; cat /tmp/r.log
+            fi
+          done
+          echo "RETRIEVER py${{ matrix.python }}: pass=$pass fail=$fail"
+          test "$fail" -eq 0
