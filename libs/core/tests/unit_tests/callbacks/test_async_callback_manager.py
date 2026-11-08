@@ -5,18 +5,26 @@ that generate traces based on the callbacks. The traces are all verified
 via snapshot testing (e.g., see unit tests for runnables).
 """
 
+import asyncio
+import contextlib
 import contextvars
 from contextlib import asynccontextmanager
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import pytest
 from typing_extensions import override
 
 from langchain_core.callbacks import (
     AsyncCallbackHandler,
     AsyncCallbackManager,
+    AsyncCallbackManagerForChainRun,
+    AsyncCallbackManagerForLLMRun,
+    AsyncCallbackManagerForRetrieverRun,
+    AsyncCallbackManagerForToolRun,
     BaseCallbackHandler,
 )
+from langchain_core.outputs import LLMResult
 
 
 async def test_inline_handlers_share_parent_context() -> None:
@@ -210,3 +218,97 @@ async def test_shielded_callback_context_preservation() -> None:
         f"but got {handler.context_values}. "
         f"This indicates the shielded decorator is not preserving context variables."
     )
+
+
+class _SuspendingEndErrorRecorder(AsyncCallbackHandler):
+    """Records every end/error callback, but only after yielding once.
+
+    Inside a cancelled anyio scope an unshielded callback dies at its first
+    suspension point, so yielding before recording makes a missing `@shielded`
+    fail deterministically.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def _record(self, name: str) -> None:
+        await asyncio.sleep(0)
+        self.calls.append(name)
+
+    @override
+    async def on_llm_end(self, response: Any, **kwargs: Any) -> None:
+        await self._record("on_llm_end")
+
+    @override
+    async def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
+        await self._record("on_llm_error")
+
+    @override
+    async def on_chain_end(self, outputs: Any, **kwargs: Any) -> None:
+        await self._record("on_chain_end")
+
+    @override
+    async def on_chain_error(self, error: BaseException, **kwargs: Any) -> None:
+        await self._record("on_chain_error")
+
+    @override
+    async def on_tool_end(self, output: Any, **kwargs: Any) -> None:
+        await self._record("on_tool_end")
+
+    @override
+    async def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
+        await self._record("on_tool_error")
+
+    @override
+    async def on_retriever_end(self, documents: Any, **kwargs: Any) -> None:
+        await self._record("on_retriever_end")
+
+    @override
+    async def on_retriever_error(self, error: BaseException, **kwargs: Any) -> None:
+        await self._record("on_retriever_error")
+
+
+_END_ERROR_CALLBACKS = [
+    (AsyncCallbackManagerForLLMRun, "on_llm_end", LLMResult(generations=[])),
+    (AsyncCallbackManagerForLLMRun, "on_llm_error", ValueError("boom")),
+    (AsyncCallbackManagerForChainRun, "on_chain_end", {"output": "x"}),
+    (AsyncCallbackManagerForChainRun, "on_chain_error", ValueError("boom")),
+    (AsyncCallbackManagerForToolRun, "on_tool_end", "x"),
+    (AsyncCallbackManagerForToolRun, "on_tool_error", ValueError("boom")),
+    (AsyncCallbackManagerForRetrieverRun, "on_retriever_end", []),
+    (AsyncCallbackManagerForRetrieverRun, "on_retriever_error", ValueError("boom")),
+]
+
+
+@pytest.mark.parametrize(
+    ("manager_cls", "method", "arg"),
+    _END_ERROR_CALLBACKS,
+    ids=[method for _, method, _ in _END_ERROR_CALLBACKS],
+)
+async def test_end_and_error_callbacks_survive_cancelled_anyio_scope(
+    manager_cls: type[Any], method: str, arg: Any
+) -> None:
+    """Every async run manager must close its run even inside a cancelled scope.
+
+    Starlette and FastAPI cancel request handlers through an anyio cancel scope
+    when the client disconnects. If an end/error callback is not shielded, the run
+    it should close is left open with no end or error event.
+    """
+    anyio = pytest.importorskip("anyio")
+    recorder = _SuspendingEndErrorRecorder()
+    manager = manager_cls(
+        run_id=uuid4(), handlers=[recorder], inheritable_handlers=[recorder]
+    )
+
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await getattr(manager, method)(arg)
+
+    # A shielded callback finishes in its own task after the scope has exited.
+    for _ in range(100):
+        if recorder.calls:
+            break
+        await asyncio.sleep(0)
+
+    assert recorder.calls == [method]

@@ -1,0 +1,64 @@
+# Linux verification (probe branch only; never merged upstream).
+# Runs the new cancellation tests the way CI runs them, 50x per Python version.
+
+name: "linux-verify"
+
+on:
+  push:
+    branches: ["ci/linux-verify"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "true"
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: libs/core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Sync dependencies
+        run: uv sync --group test
+      - name: Agent callback cancellation, 50x
+        run: |
+          pass=0; fail=0
+          for i in $(seq 1 50); do
+            if uv run --group test pytest -q -p no:cacheprovider \
+                 --disable-socket --allow-unix-socket \
+                 tests/unit_tests/callbacks/test_agent_callback_cancellation.py \
+                 tests/unit_tests/callbacks/test_async_callback_manager.py \
+                 -k "agent_callbacks or anyio" > /tmp/agent.log 2>&1; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1)); echo "--- failure on run $i ---"; cat /tmp/agent.log
+            fi
+          done
+          echo "AGENT py${{ matrix.python }}: pass=$pass fail=$fail"
+          test "$fail" -eq 0
+      - name: Tool cancellation, 50x
+        run: |
+          pass=0; fail=0
+          for i in $(seq 1 50); do
+            if uv run --group test pytest -q -p no:cacheprovider \
+                 --disable-socket --allow-unix-socket \
+                 tests/unit_tests/test_tools.py -k "anyio or cancellation" > /tmp/tool.log 2>&1; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1)); echo "--- failure on run $i ---"; cat /tmp/tool.log
+            fi
+          done
+          echo "TOOL py${{ matrix.python }}: pass=$pass fail=$fail"
+          test "$fail" -eq 0
