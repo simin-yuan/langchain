@@ -154,3 +154,35 @@ def test_interrupted_start_of_a_nested_root_run_is_closed() -> None:
         "on_chain_error",
     ], handler.events
     assert handler.events[0][1] == handler.events[1][1]
+
+
+class _RecordingHandler(BaseCallbackHandler):
+    """Records what it is given; never interrupts."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    @override
+    def on_chain_start(self, *args: Any, **kwargs: Any) -> None:
+        self.events.append("on_chain_start")
+
+    @override
+    def on_chain_error(self, *args: Any, **kwargs: Any) -> None:
+        self.events.append("on_chain_error")
+
+
+def test_handler_the_dispatch_never_reached_sees_no_error() -> None:
+    """A handler after the interrupting one never got a start, so it gets no error."""
+    interrupting = _InterruptingStartHandler("on_chain_start", "on_chain_error")
+    unreached = _RecordingHandler()
+
+    with pytest.raises(_Interrupt):
+        RunnableLambda(lambda x: x).invoke(
+            "hi", config=RunnableConfig(callbacks=[interrupting, unreached])
+        )
+
+    assert [name for name, _ in interrupting.events] == [
+        "on_chain_start",
+        "on_chain_error",
+    ], interrupting.events
+    assert unreached.events == [], unreached.events

@@ -298,6 +298,7 @@ def handle_event(
     event_name: str,
     ignore_condition_name: str | None,
     *args: Any,
+    _entered: set[int] | None = None,
     **kwargs: Any,
 ) -> None:
     """Generic event handler for `CallbackManager`.
@@ -320,6 +321,10 @@ def handle_event(
                 if ignore_condition_name is None or not getattr(
                     handler, ignore_condition_name
                 ):
+                    if _entered is not None:
+                        # Recorded before the call: a handler that is interrupted
+                        # half-way through its start callback still opened the run.
+                        _entered.add(id(handler))
                     event = getattr(handler, event_name)(*args, **kwargs)
                     if asyncio.iscoroutine(event):
                         if event_name == "on_chat_model_start":
@@ -338,6 +343,7 @@ def handle_event(
                         args[0],
                         message_strings,
                         *args[2:],
+                        _entered=_entered,
                         **kwargs,
                     )
                 else:
@@ -1411,6 +1417,7 @@ class CallbackManager(BaseCallbackManager):
         for i, prompt in enumerate(prompts):
             # Can't have duplicate runs with the same run ID (if provided)
             run_id_ = run_id if i == 0 and run_id is not None else uuid7()
+            entered: set[int] = set()
             try:
                 handle_event(
                     self.handlers,
@@ -1423,13 +1430,14 @@ class CallbackManager(BaseCallbackManager):
                     tags=self.tags,
                     metadata=self.metadata,
                     **kwargs,
+                    _entered=entered,
                 )
             except BaseException as e:
                 # The start dispatch was interrupted partway through (e.g. an
                 # interrupt raised from inside a handler). Handlers may already
                 # have opened the run, so close it before letting it out.
                 handle_event(
-                    self.handlers,
+                    [h for h in self.handlers if id(h) in entered],
                     "on_llm_error",
                     "ignore_llm",
                     e,
@@ -1481,6 +1489,7 @@ class CallbackManager(BaseCallbackManager):
                 run_id = None
             else:
                 run_id_ = uuid7()
+            entered: set[int] = set()
             try:
                 handle_event(
                     self.handlers,
@@ -1493,13 +1502,14 @@ class CallbackManager(BaseCallbackManager):
                     tags=self.tags,
                     metadata=self.metadata,
                     **kwargs,
+                    _entered=entered,
                 )
             except BaseException as e:
                 # The start dispatch was interrupted partway through (e.g. an
                 # interrupt raised from inside a handler). Handlers may already
                 # have opened the run, so close it before letting it out.
                 handle_event(
-                    self.handlers,
+                    [h for h in self.handlers if id(h) in entered],
                     "on_llm_error",
                     "ignore_llm",
                     e,
@@ -1546,6 +1556,7 @@ class CallbackManager(BaseCallbackManager):
         """
         if run_id is None:
             run_id = uuid7()
+        entered: set[int] = set()
         try:
             handle_event(
                 self.handlers,
@@ -1558,13 +1569,14 @@ class CallbackManager(BaseCallbackManager):
                 tags=self.tags,
                 metadata=self.metadata,
                 **kwargs,
+                _entered=entered,
             )
         except BaseException as e:
             # The start dispatch was interrupted partway through (e.g. an
             # interrupt raised from inside a handler). Handlers may already have
             # opened the run, so close it before letting it out.
             handle_event(
-                self.handlers,
+                [h for h in self.handlers if id(h) in entered],
                 "on_chain_error",
                 "ignore_chain",
                 e,
@@ -1621,6 +1633,7 @@ class CallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
+        entered: set[int] = set()
         try:
             handle_event(
                 self.handlers,
@@ -1634,13 +1647,14 @@ class CallbackManager(BaseCallbackManager):
                 metadata=self.metadata,
                 inputs=inputs,
                 **kwargs,
+                _entered=entered,
             )
         except BaseException as e:
             # The start dispatch was interrupted partway through (e.g. an
             # interrupt raised from inside a handler). Handlers may already have
             # opened the run, so close it before letting it out.
             handle_event(
-                self.handlers,
+                [h for h in self.handlers if id(h) in entered],
                 "on_tool_error",
                 "ignore_agent",
                 e,
@@ -1686,6 +1700,7 @@ class CallbackManager(BaseCallbackManager):
         if run_id is None:
             run_id = uuid7()
 
+        entered: set[int] = set()
         try:
             handle_event(
                 self.handlers,
@@ -1698,13 +1713,14 @@ class CallbackManager(BaseCallbackManager):
                 tags=self.tags,
                 metadata=self.metadata,
                 **kwargs,
+                _entered=entered,
             )
         except BaseException as e:
             # The start dispatch was interrupted partway through (e.g. an
             # interrupt raised from inside a handler). Handlers may already have
             # opened the run, so close it before letting it out.
             handle_event(
-                self.handlers,
+                [h for h in self.handlers if id(h) in entered],
                 "on_retriever_error",
                 "ignore_retriever",
                 e,
