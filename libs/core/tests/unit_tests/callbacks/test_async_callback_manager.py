@@ -5,16 +5,20 @@ that generate traces based on the callbacks. The traces are all verified
 via snapshot testing (e.g., see unit tests for runnables).
 """
 
+import asyncio
+import contextlib
 import contextvars
 from contextlib import asynccontextmanager
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import pytest
 from typing_extensions import override
 
 from langchain_core.callbacks import (
     AsyncCallbackHandler,
     AsyncCallbackManager,
+    AsyncCallbackManagerForToolRun,
     BaseCallbackHandler,
 )
 
@@ -210,3 +214,67 @@ async def test_shielded_callback_context_preservation() -> None:
         f"but got {handler.context_values}. "
         f"This indicates the shielded decorator is not preserving context variables."
     )
+
+
+class _SuspendingToolRecorder(AsyncCallbackHandler):
+    """Records tool callbacks, but only after yielding once.
+
+    Recording only after a yield makes a missing `@shielded` fail
+    deterministically rather than depending on timing.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def _record(self, name: str) -> None:
+        await asyncio.sleep(0)
+        self.calls.append(name)
+
+    @override
+    async def on_tool_end(self, output: Any, **kwargs: Any) -> None:
+        await self._record("on_tool_end")
+
+    @override
+    async def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
+        await self._record("on_tool_error")
+
+
+_TOOL_CALLBACKS: list[tuple[str, Any]] = [
+    ("on_tool_end", "result"),
+    ("on_tool_error", ValueError("boom")),
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "arg"),
+    _TOOL_CALLBACKS,
+    ids=[method for method, _ in _TOOL_CALLBACKS],
+)
+async def test_tool_callbacks_survive_cancelled_anyio_scope(
+    method: str, arg: Any
+) -> None:
+    """Tool callbacks must still fire when the enclosing scope is cancelled.
+
+    `BaseTool.arun` reports the cancellation through `on_tool_error`, but inside
+    a cancelled scope that await re-raises at the first suspension point, so a
+    tool run ends with no end or error event in its trace unless the callback is
+    shielded.
+    """
+    anyio = pytest.importorskip("anyio")
+    recorder = _SuspendingToolRecorder()
+    manager = AsyncCallbackManagerForToolRun(
+        run_id=uuid4(), handlers=[recorder], inheritable_handlers=[recorder]
+    )
+
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await getattr(manager, method)(arg)
+
+    # A shielded callback finishes in its own task after the scope has exited.
+    for _ in range(100):
+        if recorder.calls:
+            break
+        await asyncio.sleep(0)
+
+    assert recorder.calls == [method]
